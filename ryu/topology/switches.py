@@ -34,15 +34,14 @@ from ryu.lib.packet import packet, ethernet
 from ryu.lib.packet import lldp, ether_types
 from ryu.ofproto.ether import ETH_TYPE_LLDP
 from ryu.ofproto.ether import ETH_TYPE_CFM
+from ryu.ofproto.ether import ETH_TYPE_IPV6
 from ryu.ofproto import nx_match
 from ryu.ofproto import ofproto_v1_0
 from ryu.ofproto import ofproto_v1_2
 from ryu.ofproto import ofproto_v1_3
 from ryu.ofproto import ofproto_v1_4
 
-
 LOG = logging.getLogger(__name__)
-
 
 CONF = cfg.CONF
 
@@ -55,6 +54,8 @@ CONF.register_cli_opts([
     cfg.BoolOpt('explicit-drop', default=True,
                 help='link discovery: explicitly drop lldp packet in')
 ])
+
+DEFAULT_TTL = 120
 
 
 class Port(object):
@@ -76,7 +77,7 @@ class Port(object):
 
     def is_down(self):
         return (self._state & self._ofproto.OFPPS_LINK_DOWN) > 0 \
-            or (self._config & self._ofproto.OFPPC_PORT_DOWN) > 0
+               or (self._config & self._ofproto.OFPPC_PORT_DOWN) > 0
 
     def is_live(self):
         # NOTE: OF1.2 has OFPPS_LIVE state
@@ -102,7 +103,7 @@ class Port(object):
     def __str__(self):
         LIVE_MSG = {False: 'DOWN', True: 'LIVE'}
         return 'Port<dpid=%s, port_no=%s, %s>' % \
-            (self.dpid, self.port_no, LIVE_MSG[self.is_live()])
+               (self.dpid, self.port_no, LIVE_MSG[self.is_live()])
 
 
 class Switch(object):
@@ -244,16 +245,28 @@ class PortState(dict):
 
 
 class PortData(object):
-    def __init__(self, is_down, lldp_data):
+    # def __init__(self, is_down, lldp_data):
+    #     super(PortData, self).__init__()
+    #     self.is_down = is_down
+    #     self.lldp_data = lldp_data
+    #     self.timestamp = None
+    #     self.sent = 0
+    #     self.delay = 0
+
+    def __init__(self, is_down, lldp_data=None):
         super(PortData, self).__init__()
         self.is_down = is_down
         self.lldp_data = lldp_data
         self.timestamp = None
         self.sent = 0
+        self.delay = 0
 
-    def lldp_sent(self):
+    def lldp_sent(self, port):
         self.timestamp = time.time()
         self.sent += 1
+        lldp_data = LLDPPacket.lldp_packet(
+            port.dpid, port.port_no, port.hw_addr, DEFAULT_TTL, time.time())
+        self.lldp_data = lldp_data
 
     def lldp_received(self):
         self.sent = 0
@@ -269,7 +282,7 @@ class PortData(object):
 
     def __str__(self):
         return 'PortData<live=%s, timestamp=%s, sent=%d>' \
-            % (not self.is_down, self.timestamp, self.sent)
+               % (not self.is_down, self.timestamp, self.sent)
 
 
 class PortDataState(dict):
@@ -310,16 +323,16 @@ class PortDataState(dict):
         self._remove_key(key)
         self._prepend_key(key)
 
-    def add_port(self, port, lldp_data):
+    def add_port(self, port):
         if port not in self:
             self._prepend_key(port)
-            self[port] = PortData(port.is_down(), lldp_data)
+            self[port] = PortData(port.is_down())
         else:
             self[port].is_down = port.is_down()
 
     def lldp_sent(self, port):
         port_data = self[port]
-        port_data.lldp_sent()
+        port_data.lldp_sent(port)
         self._move_last_key(port)
         return port_data
 
@@ -425,14 +438,15 @@ class LLDPPacket(object):
     CHASSIS_ID_PREFIX_LEN = len(CHASSIS_ID_PREFIX)
     CHASSIS_ID_FMT = CHASSIS_ID_PREFIX + '%s'
 
-    PORT_ID_STR = '!I'      # uint32_t
+    PORT_ID_STR = '!I'  # uint32_t
     PORT_ID_SIZE = 4
 
     class LLDPUnknownFormat(RyuException):
         message = '%(msg)s'
 
+
     @staticmethod
-    def lldp_packet(dpid, port_no, dl_addr, ttl):
+    def lldp_packet(dpid, port_no, dl_addr, ttl, timestamp):
         pkt = packet.Packet()
 
         dst = lldp.LLDP_MAC_NEAREST_BRIDGE
@@ -452,9 +466,10 @@ class LLDPPacket(object):
                                       port_no))
 
         tlv_ttl = lldp.TTL(ttl=ttl)
+        tlv_timestamp = lldp.TimeStamp(timestamp=timestamp)
         tlv_end = lldp.End()
 
-        tlvs = (tlv_chassis_id, tlv_port_id, tlv_ttl, tlv_end)
+        tlvs = (tlv_chassis_id, tlv_port_id, tlv_ttl, tlv_timestamp, tlv_end)
         lldp_pkt = lldp.lldp(tlvs)
         pkt.add_protocol(lldp_pkt)
 
@@ -490,9 +505,12 @@ class LLDPPacket(object):
         if len(port_id) != LLDPPacket.PORT_ID_SIZE:
             raise LLDPPacket.LLDPUnknownFormat(
                 msg='unknown port id %d' % port_id)
-        (src_port_no, ) = struct.unpack(LLDPPacket.PORT_ID_STR, port_id)
+        (src_port_no,) = struct.unpack(LLDPPacket.PORT_ID_STR, port_id)
 
-        return src_dpid, src_port_no
+        tlv_timestamp = lldp_pkt.tlvs[3]
+        timestamp = tlv_timestamp.timestamp
+
+        return src_dpid, src_port_no, timestamp
 
 
 class Switches(app_manager.RyuApp):
@@ -505,8 +523,8 @@ class Switches(app_manager.RyuApp):
                event.EventLinkAdd, event.EventLinkDelete,
                event.EventHostAdd]
 
-    DEFAULT_TTL = 120  # unused. ignored.
-    LLDP_PACKET_LEN = len(LLDPPacket.lldp_packet(0, 0, DONTCARE_STR, 0))
+   
+    LLDP_PACKET_LEN = len(LLDPPacket.lldp_packet(0, 0, DONTCARE_STR, 0, 0))
 
     LLDP_SEND_GUARD = .05
     LLDP_SEND_PERIOD_PER_PORT = .9
@@ -517,11 +535,11 @@ class Switches(app_manager.RyuApp):
         super(Switches, self).__init__(*args, **kwargs)
 
         self.name = 'switches'
-        self.dps = {}                 # datapath_id => Datapath class
-        self.port_state = {}          # datapath_id => ports
+        self.dps = {}  # datapath_id => Datapath class
+        self.port_state = {}  # datapath_id => ports
         self.ports = PortDataState()  # Port class -> PortData class
-        self.links = LinkState()      # Link class -> timestamp
-        self.hosts = HostState()      # mac address -> Host class list
+        self.links = LinkState()  # Link class -> timestamp
+        self.hosts = HostState()  # mac address -> Host class list
         self.is_active = True
 
         self.link_discovery = self.CONF.observe_links
@@ -570,11 +588,7 @@ class Switches(app_manager.RyuApp):
                     return p
 
     def _port_added(self, port):
-        lldp_data = LLDPPacket.lldp_packet(
-            port.dpid, port.port_no, port.hw_addr, self.DEFAULT_TTL)
-        self.ports.add_port(port, lldp_data)
-        # LOG.debug('_port_added dpid=%s, port_no=%s, live=%s',
-        #           port.dpid, port.port_no, port.is_live())
+        self.ports.add_port(port)
 
     def _link_down(self, port):
         try:
@@ -633,7 +647,7 @@ class Switches(app_manager.RyuApp):
                 if ofproto.OFP_VERSION == ofproto_v1_0.OFP_VERSION:
                     rule = nx_match.ClsRule()
                     rule.set_dl_dst(addrconv.mac.text_to_bin(
-                                    lldp.LLDP_MAC_NEAREST_BRIDGE))
+                        lldp.LLDP_MAC_NEAREST_BRIDGE))
                     rule.set_dl_type(ETH_TYPE_LLDP)
                     actions = [ofproto_parser.OFPActionOutput(
                         ofproto.OFPP_CONTROLLER, self.LLDP_PACKET_LEN)]
@@ -652,7 +666,7 @@ class Switches(app_manager.RyuApp):
                                                       ofproto.OFPCML_NO_BUFFER
                                                       )]
                     inst = [parser.OFPInstructionActions(
-                            ofproto.OFPIT_APPLY_ACTIONS, actions)]
+                        ofproto.OFPIT_APPLY_ACTIONS, actions)]
                     mod = parser.OFPFlowMod(datapath=dp, match=match,
                                             idle_timeout=0, hard_timeout=0,
                                             instructions=inst,
@@ -774,7 +788,8 @@ class Switches(app_manager.RyuApp):
 
         msg = ev.msg
         try:
-            src_dpid, src_port_no = LLDPPacket.lldp_parse(msg.data)
+            # src_dpid, src_port_no = LLDPPacket.lldp_parse(msg.data)
+            src_dpid, src_port_no, timestamp = LLDPPacket.lldp_parse(msg.data)
         except LLDPPacket.LLDPUnknownFormat:
             # This handler can receive all the packets which can be
             # not-LLDP packet. Ignore it silently
@@ -942,10 +957,10 @@ class Switches(app_manager.RyuApp):
                 self.send_lldp_packet(port)
             for port in ports:
                 self.send_lldp_packet(port)
-                hub.sleep(self.LLDP_SEND_GUARD)      # don't burst
+                hub.sleep(self.LLDP_SEND_GUARD)  # don't burst
 
             if timeout is not None and ports:
-                timeout = 0     # We have already slept
+                timeout = 0  # We have already slept
             # LOG.debug('lldp sleep %s', timeout)
             self.lldp_event.wait(timeout=timeout)
 
@@ -1018,3 +1033,35 @@ class Switches(app_manager.RyuApp):
 
         rep = event.EventHostReply(req.src, dpid, hosts)
         self.reply_to_request(req, rep)
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        # add code for getting LLDP packet receiving timestamp
+        recv_timestamp = time.time()
+        if not self.link_discovery:
+            return
+
+        msg = ev.msg
+        try:
+            src_dpid, src_port_no, timestamp = LLDPPacket.lldp_parse(msg.data)
+        except LLDPPacket.LLDPUnknownFormat as e:
+            # This handler can receive all the packtes which can be
+            # not-LLDP packet. Ignore it silently
+            return
+
+        dst_dpid = msg.datapath.id
+        if msg.datapath.ofproto.OFP_VERSION == ofproto_v1_0.OFP_VERSION:
+            dst_port_no = msg.in_port
+        elif msg.datapath.ofproto.OFP_VERSION >= ofproto_v1_2.OFP_VERSION:
+            dst_port_no = msg.match['in_port']
+        else:
+            LOG.error('cannot accept LLDP. unsupported version. %x',
+                      msg.datapath.ofproto.OFP_VERSION)
+
+        # get the lldp delay, and save it into port_data.
+        for port in self.ports.keys():
+            if src_dpid == port.dpid and src_port_no == port.port_no:
+                send_timestamp = self.ports[port].timestamp
+                if send_timestamp:
+                    self.ports[port].delay = recv_timestamp - send_timestamp
+
